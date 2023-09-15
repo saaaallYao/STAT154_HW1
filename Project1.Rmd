@@ -1,0 +1,349 @@
+---
+title: "Project 1"
+author: "Juliette Decugis, Vinay Gautam, Adam Mills, Chenxi Yao"
+output: pdf_document
+date: "2022-09-26"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Project 1: Discover the genes associated with survival time in a common cancer
+
+## Loading and Renaming the Data
+
+```{r Load data, warning = FALSE, echo = FALSE, message=FALSE}
+library(tidyverse)
+library(data.table)
+library(skimr)
+#library(dplyr)  #this is in tidyverse
+#library(ggplot2)  #this is in tidyverse
+library(vdocs)
+library(grid)
+library(gridExtra)
+library(caret)
+library(ranger)
+
+#To change based on who is working on this. 
+DATA_DIR <- "~/Downloads/HW1"  
+mrna_orig <- fread(file.path(DATA_DIR, "data_mrna_agilent_microarray.txt")) %>%
+  as_tibble() 
+clinical_orig <- fread(file.path(DATA_DIR, "brca_metabric_clinical_data.tsv")) %>%
+  as_tibble()
+rm(DATA_DIR)
+```
+
+```{r Rename data}
+colnames(clinical_orig) <- c("Study_ID","Patient_ID","Sample_ID","Age_at_Diagnosis",
+ "Type_of_Breast_Surgery","Cancer_Type","Cancer_Type_Detailed","Cellularity",
+ "Chemotherapy","Pam50PlusClaudinMinusLow_Subtype","Cohort",
+ "ER_status_measured_by_IHC","ER_Status","Neoplasm_Histologic_Grade",
+ "HER2_status_measured_by_SNP6","HER2_Status","Tumor_Other_Histologic_Subtype",
+ "Hormone_Therapy","Inferred_Menopausal_State","Integrative_Cluster",
+ "Primary_Tumor_Laterality","Lymph_nodes_examined_positive","Mutation_Count",
+ "Nottingham_prognostic_index","Oncotree_Code","Overall_Survival_Months",
+ "Overall_Survival_Status","PR_Status","Radio_Therapy","Relapse_Free_Status_Months",
+ "Relapse_Free_Status","Number_of_Samples_Per_Patient","Sample_Type","Sex",
+ "3Gene_classifier_subtype","TMB_nonsynonymous","Tumor_Size","Tumor_Stage",
+ "Patient_Vital_Status")
+
+#Study_ID only has 1 value, so we can drop it.
+#Patient_ID is always equal to Sample_ID, so can drop one of those too.
+#Sex is all Female, Sample_Type is all the same, Number_of_Samples_Per_Patient,
+clinical_clean_v1 <- clinical_orig %>% select(-Study_ID,-Sample_ID,-Sex,
+          -Sample_Type,-Number_of_Samples_Per_Patient)
+
+#if you want to check frequency of elements in a table
+#   The useNA part will make sure to include NA
+# clinical_orig$Relapse_Free_Status %>% table(useNA = "always")
+
+
+#Relapse_Free_Status into binary, Overall_Survival_Status into binary.
+clinical_clean_v1 <- mutate(clinical_clean_v1,Relapse = 
+                              case_when(
+                                Relapse_Free_Status == "0:Not Recurred" ~ 0,
+                                Relapse_Free_Status == "1:Recurred" ~ 1
+                              ), Died = 
+                              case_when(
+                                Overall_Survival_Status == "0:LIVING" ~ 0,
+                                Overall_Survival_Status == "1:DECEASED" ~ 1
+                              )
+)
+
+#adding a column for the age when people die.
+clinical_clean_v1 <- clinical_clean_v1 %>% 
+  mutate(age_death = case_when(
+    Overall_Survival_Status == 1 ~ Overall_Survival_Months/12 + Age_at_Diagnosis
+  )
+)
+
+
+#a table for the general population life expectancy.
+#At a certain age, this is how many years we expect a `normal` American 
+#woman to live.
+# Taken from https://www.ssa.gov/oact/STATS/table4c6.html
+life_exp_table <- tibble(age = c(20:97),
+   exp_years_left = c(
+     61.93,60.95,59.98,59.01,58.04,57.07,56.11,55.14,54.17,53.21,
+     52.25,51.29,50.34,49.38,48.43,47.48,46.53,45.59,44.64,43.7,42.76,41.82,
+     40.88,39.95,39.01,38.08,37.16,36.24,35.32,34.41,33.5,32.6,31.71,30.82,
+     29.93,29.06,28.19,27.33,26.48,25.63,24.79,23.96,23.14,22.32,21.51,20.7,
+     19.89,19.1,18.31,17.52,16.75,16,15.25,14.52,13.8,13.1,12.41,11.74,
+     11.08,10.45,9.83,9.23,8.65,8.09,7.56,7.05,6.56,6.1,5.67,5.26,4.88,
+     4.52,4.2,3.9,3.63,3.39,3.17,2.98)
+)
+#exp_life is the age we predict given their current age.
+life_exp_table <- life_exp_table %>% mutate(total_exp_life = age + exp_years_left)
+
+
+#One Attempt to normalize data. take the age_death and compare it to exp_life
+#We cant use the people who haven't died yet for this metric. still have 1144 ppl
+# that died.
+
+#This makes a table of exp_years_left for each person
+temp <- tibble(age=round(clinical_clean_v1$Age_at_Diagnosis))
+temp <- left_join(temp,life_exp_table)
+
+#Add a column for diff in actual age of death vs life expectancy
+clinical_clean_v1 <- clinical_clean_v1 %>% mutate(
+  norm_life = (age_death - temp$total_exp_life )/ temp$total_exp_life
+)
+```
+
+## Filtering Data & EDA
+
+For binarization, we take account in two factors, overall survival status and relapse status. We define the group of people who have no relapse and are still alive as "high survival"(Upper left in the graph) and the group of people who have relapse and are already dead as "low survival"(Lower right). We ignore the other two groups to create a clear binarization. We observe based on the plot below that people that are still alive and have no relapse tend to survive more than 50 months (around 4 years) whereas the people that relapsed and died survived less than 50 months. We wanted to find genes that led to people not relapsing and surviving. We decided not to include survival months in our binarization as we were more interested in whether people were alive and had not relapsed therefore their quality of life, rather than overall survival length.
+
+```{r Binarization, fig.align='center', fig.width=4.5, fig.height=4.5}
+ggplot(data = filter(clinical_clean_v1, Relapse != 'NA', Died != 'NA'))+
+  geom_histogram(aes(x = Overall_Survival_Months), fill = 'light blue', 
+                 color = "white", binwidth = 12)+
+  facet_grid(`Overall_Survival_Status`~`Relapse_Free_Status`)+
+  labs(x = "Overall Survival Months", 
+       title = "Binarization between Relapse Status and Survival Status",
+       y = "Counts") +
+  theme(axis.text.x = element_text( vjust = .5),
+        plot.title = element_text(hjust = .5),
+        panel.background = element_rect(fill="white",color = "black"),
+        panel.grid = element_line(color = "light gray"),
+        legend.position = "none")
+```
+
+### Dropping NA survival months
+
+As survival months has a very high influence on our low vs. high binarization, we decided it would be too risky to attempt to solve for the NA values.
+
+```{r}
+sum(is.na(clinical_clean_v1$Overall_Survival_Months))
+clinical_clean_v2 <- clinical_clean_v1 %>% drop_na(Overall_Survival_Months)
+clinical_clean_v2 %>% nrow()
+```
+
+We drop 528 patients with NA survival months.
+
+### Dropping Death due to Other Causes
+
+We remove the patients who died of other causes, since those patients would be considered very low survival but don't reflect actual cancer progression.
+
+```{r}
+clinical_clean_v2 <- clinical_clean_v2 %>% 
+  filter(!(Patient_Vital_Status == "Died of Other Causes"))
+clinical_clean_v2 %>% nrow()
+```
+
+### Dropping Recent Diagnosis
+
+We remove patients who have survived less than 3 years but are still alive. We assumed those patients got recently diagnosed and may not properly reflect survival times.
+
+```{r}
+clinical_clean_v2 <- clinical_clean_v2 %>% 
+  filter(!(Overall_Survival_Months <= 36 & Died == 0))
+clinical_clean_v2 %>% nrow()
+clinical_clean_v3 <- clinical_clean_v2 %>% filter(Age_at_Diagnosis > 40 & Age_at_Diagnosis < 80)
+```
+
+**We are left with 1443 patients in our classification task.**
+
+## EDA Plot Relapse
+
+We notice that after data sculpting, we observe similar survival months across age
+
+```{r, warning=FALSE, fig.height= 8, fig.width=4.5, message=FALSE, fig.align='center'}
+# Plot before sculpting
+clinical_clean_v1$Relapse = as.character(clinical_clean_v1$Relapse)
+plot_before <- ggplot(data = filter(clinical_clean_v1, Relapse != "NA")) +
+  aes(y = `Overall_Survival_Months`, x = `Age_at_Diagnosis`, 
+      color = `Relapse`) +
+  scale_color_manual(values = c("#003262","#FDB515")) +
+  geom_point(size = 0.5) +
+  geom_smooth()+
+  labs(x = "Age at Diagnosis", y = "Overall Survival Months",
+  title = "Relationship between Survival month and \nDiagnosis Age Before Sculpting") +
+  theme(axis.text.x = element_text( vjust = .5),
+        plot.title = element_text(hjust = .5),
+        panel.background = element_rect(fill="white",color = "black"),
+        panel.grid = element_line(color = "light gray"))
+        #legend.position = "none")
+
+# Plot after sculpting
+clinical_clean_v2$Relapse = as.character(clinical_clean_v2$Relapse)
+plot_after <- ggplot(data = filter(clinical_clean_v2, Relapse != "NA")) +
+  aes(y = `Overall_Survival_Months`, x = `Age_at_Diagnosis`, 
+      color = `Relapse`) +
+  geom_point(size = 0.5) +
+  geom_smooth()+
+  scale_color_manual(values = c("#003262","#FDB515")) +
+  labs(x = "Age at Diagnosis", y = "Overall Survival Months",
+  title = "Relationship between Survival month and \nDiagnosis After Sculpting") +
+  theme(axis.text.x = element_text( vjust = .5),
+        plot.title = element_text(hjust = .5),
+        panel.background = element_rect(fill="white",color = "black"),
+        panel.grid = element_line(color = "light gray"))
+        #legend.position = "bottom")
+
+#grid.arrange(plot_before, plot_after, ncol = 1)
+
+library(patchwork)
+combined <- plot_before + plot_after & theme(legend.position = "bottom")
+combined + plot_layout(ncol = 1, guides = "collect")
+
+```
+
+```{r Split the data to CV and find a model. Also find OOB Goal, warning=FALSE, echo = FALSE, eval = FALSE}
+#clinical_orig <- fread(file.path(DATA_DIR, "clinical_clean_v2.tsv")) %>% as_tibble()
+clinical_orig <- clinical_clean_v3
+
+clinical_orig <- clinical_orig %>% 
+  mutate(
+    y = case_when(
+      Died == 1 & Relapse == 1 ~ "Low",
+      Died == 0 & Relapse == 0 ~ "High",
+      TRUE ~ NA_character_  # to be thrown out later
+    )
+)
+
+X <- mrna_orig %>%
+  select(-Hugo_Symbol, -Entrez_Gene_Id) %>%
+  t() %>%
+  as.data.frame()
+
+colnames(X) <- make.names(mrna_orig$Hugo_Symbol, unique = TRUE)
+
+#Just to check stuff
+#bind_cols(head(rownames(X)), head(clinical_orig$Patient_ID))
+
+y <- left_join(
+  x = data.frame(Patient_ID = rownames(X), check.names = FALSE),
+  y = clinical_orig,
+  by = "Patient_ID"
+) %>%
+  pull(y)
+
+keep_samples <- !is.na(y)
+X <- X[keep_samples, ]
+y <- y[keep_samples]
+
+row_na_idx <- apply(X, 1, function(x) any(is.na(x)))
+print(sprintf("# rows with NAs: %s", sum(row_na_idx)))
+
+gene_na_idx <- apply(X, 2, function(x) any(is.na(x)))
+print(sprintf("# columns with NAs: %s", sum(gene_na_idx)))
+
+X <- X[!row_na_idx, ]
+y <- y[!row_na_idx]
+
+#reduce size of X
+set.seed(5000)
+keep_p <- 5000
+var_vec <- apply(X, 2, var)
+var_threshold <- sort(var_vec, decreasing = T)[keep_p]
+X_filtered <- X[, var_vec >= var_threshold]
+```
+
+```{r}
+cv <-X_filtered[sample(nrow(X_filtered)),]
+percentile <- ceiling(nrow(cv) * 0.8)
+training <- head(cv, percentile)
+testing <- tail(cv, nrow(cv) - percentile)
+
+training_y <- head(y, percentile)
+testing_y <- tail(y, nrow(cv) - percentile)
+
+#Randomly shuffle the training data
+# training<-training[sample(nrow(training)),]
+
+fit_df <- bind_cols(training_y = factor(training_y, levels = c("Low", "High")), training)
+
+rf_fit <- train(as.factor(training_y) ~ ., 
+                data = training, 
+                method = "ranger")
+#Get our predicted values
+rf_pred <- predict(rf_fit, training)
+sum(rf_pred$predictions == training_y)
+#length(predicted_values$predictions)
+```
+
+```{r}
+rf_fit <- ranger(y ~., data = fit_df,
+                 importance = "impurity")
+
+
+cat(sprintf("OOB Classification Error: %s\n", rf_fit$prediction.error))
+cat("OOB Confusion Table:\n")
+print(rf_fit$confusion.matrix)
+
+#Compare to classifying everyone as the same. close to 50%
+y %>% table()
+cat(sprintf("Classify All as the same: %s\n", 677/(677+620)))
+
+################################################################################
+################################################################################
+#Time to fit the model with CV. Using Caret library, we will take 80% of the 
+#data to use for training and validation via CV, and 20% of the data will 
+#be the test data.
+set.seed(5000)
+random_sample <- createDataPartition(fit_df$y, p = 0.8, list = FALSE)
+
+# Create the training data and the testing data.
+training_dataset  <- fit_df[random_sample, ]
+testing_dataset <- fit_df[-random_sample, ]
+
+#Setting the levels of CV. 
+fit_control <- trainControl(## 10-fold CV
+  method = "cv",
+  number = 10)
+
+#Time to train our model! 
+# WARNING: TAKES A LONG TIME. REDUCE TREE SIZE OR SIZE OF CV TO RUN FASTER
+rf_fit <- train(as.factor(y) ~ ., 
+                data = training_dataset, 
+                method = "ranger",
+                trControl = fit_control)
+
+#View the model output
+rf_fit
+
+#Get our predicted values
+rf_pred <- predict(rf_fit, newdata = testing_dataset)
+
+#Find the Success rate, and compare with the OOB Error rate.
+sum(rf_pred == testing_dataset$y)/length(testing_dataset$y)
+
+################################################################################
+##### #####  ##### ##### ##### #   #  ##       
+#     #   #    #   #     #   # ## ##  ##      
+#  ## #   #    #   ##### ##### # # #  ##      
+#   # #   #    #   #     #   # #   #          
+##### #####    #   ##### #   # #   #  ##     
+################################################################################
+```
+
+```{r plot}
+
+select(fit_df, c(501))
+
+ggplot(fit_df)+
+  geom_point(aes(x = BRD3, y = BRF2, color = y))
+fit_df$br
+```
